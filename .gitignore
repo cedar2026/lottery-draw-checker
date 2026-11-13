@@ -1,0 +1,9 @@
+# 本地配置文件和日志，不提交
+settings.json
+tickets.json
+pending_tasks.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
