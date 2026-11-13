@@ -5,11 +5,29 @@
 
 三个版本，同一套核心，配置通用（`settings.json` / `tickets.json` 放同一个文件夹里就能混用）：
 
-| 版本 | 文件 | 适合谁 |
-| --- | --- | --- |
-| 服务器版 | `server/lottery_checker.pyw` | 挂服务器上常驻，开奖日晚上自动抓、自动推，不用打开 |
-| 个人版 | `personal/lottery_checker_personal.pyw` | 装自己电脑上，早上上班/下班打开就自动抓一次，抓到新一期就推，看完就关 |
-| agent 版 | `agent/lottery_cli.py` + `agent/SKILL.md` | 给智能体用的命令行版，智能体按 SKILL.md 配好、设好定时任务，到点自己跑 |
+| 版本 | 源码文件 | exe 文件 | 适合谁 |
+| --- | --- | --- | --- |
+| 服务器版 | `server/lottery_checker.pyw` | `lottery_checker.exe` | 挂服务器上常驻，开奖日晚上自动抓、自动推，不用打开 |
+| 个人版 | `personal/lottery_checker_personal.pyw` | `lottery_checker_personal.exe` | 装自己电脑上，早上上班/下班打开就自动抓一次，抓到新一期就推，看完就关 |
+| agent 版 | `agent/lottery_cli.py` + `agent/SKILL.md` | `lottery_cli.exe` | 给智能体用的命令行版，智能体按 SKILL.md 配好、设好定时任务，到点自己跑 |
+
+## 小白上手（不用装 Python，推荐）
+
+1. **下载 exe**：打开 [Releases 页](https://github.com/cedar2026/lottery-draw-checker/releases)，下载最新版的 exe。自己电脑上用，下载 `lottery_checker_personal.exe` 就行。
+2. **第一次打开**：Windows 可能会弹「Windows 已保护你的电脑」——点「更多信息」→「仍要运行」。没买代码签名证书都会这样，不是病毒。
+3. **装 Bark**：iPhone 上打开 App Store 搜 `Bark` 安装，打开 App，里面那串 key 就是你的推送密钥，复制下来。（Bark 是 iOS 应用，收推送需要一台 iPhone。）
+4. **填 key、加号**：打开 exe，在界面里填上 Bark key，再加自己买的号码。
+5. **验货**：点「测试」发一条测试推送，手机收到才算链路真的通了。收不到就检查 key 有没有复制全。
+6. **购彩提醒（可选）**：在「购彩提醒」页加提醒，选推送到哪个 key、勾选周几、设准确时间点，到点推一次、当天不重复推。
+
+## 源码运行（要装 Python）
+
+1. **装 Python**：打开 [python.org](https://www.python.org/downloads/) 下载 Windows 安装包，安装时勾选 `Add Python to PATH`，然后一路下一步。装完打开命令行输 `python --version`，能显示版本号就是装好了。
+2. **下载代码**：在本仓库页面点绿色的 `Code` 按钮 → `Download ZIP`，下载后解压到一个文件夹。
+3. **运行**：Windows 上双击 `.pyw` 文件就行。agent 版在命令行跑 `python3 lottery_cli.py check`，具体看 `agent/SKILL.md`。
+4. **填 key、加号、验货**：同上面第 3–5 步。时间一律按北京时间（固定 UTC+8）。
+
+只用 Python 标准库，不用再装别的依赖（`certifi` 可选装，证书出问题时多一条兜底）。
 
 ## 能干什么
 
@@ -25,14 +43,6 @@
 - 不预测：不给号码、不分析走势，只核对你自己填的号。
 - 不收集：号码和 Bark key 只存在你自己电脑本地，不上传到任何地方。
 - 不带广告：没有预测、没有购彩引导，开源自托管，挂服务器上不用管。
-
-## 怎么跑
-
-- Python 3，只用标准库（`certifi` 可选装，证书出问题时多一条兜底）
-- 服务器版/个人版：Windows 上双击 `.pyw` 就行
-- agent 版：`python3 lottery_cli.py check`，具体看 `agent/SKILL.md`
-- 时间一律按北京时间（固定 UTC+8）
-- 第一次打开：在界面里填自己的 Bark key，再加自己的号码；agent 版跑 `add-key` / `add-ticket`，然后必须跑一次 `test` 验货——手机收到测试推送才算链路真的通了
 
 ## 隐私提醒
 
