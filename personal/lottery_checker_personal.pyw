@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import ssl
+import sys
 import threading
 import time
 import traceback
@@ -47,7 +48,12 @@ except Exception:  # 供无图形环境的单元测试导入核心逻辑时使�
     ttk = None
 
 BJ = timezone(timedelta(hours=8))
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# PyInstaller 打包成 exe 后 __file__ 指向临时解压目录，配置会存丢；
+# 冻结运行时改按 exe 所在目录存，脚本运行时行为不变。
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TICKETS_FILE = os.path.join(BASE_DIR, "tickets.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 PENDING_FILE = os.path.join(BASE_DIR, "pending_tasks.json")
