@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""彩票小软件 v1.9（个人版）
-双色球 + 大乐透，监控自己买的号，开奖后用 Bark 推送。
+"""彩票小软件 v1.10（个人版）
+双色球 + 大乐透，监控自己买的号，开奖后推送到手机：Bark（iPhone）或 Server酱（微信，安卓苹果都能收）。
+v1.10 改动：同服务器版（Server酱推送通道 + 复式支持）。
 个人版和服务器版是同一套代码，只差一点：个人版打开软件就自动抓一次，
 抓到没推过的新一期就推，适合装在自己电脑上、早上上班/下班打开看一眼就关；
 服务器版靠后台轮询，不用打开也能推。
 只用 Python 标准库。时间一律北京时间（固定 UTC+8，不用 ZoneInfo）。
-奖级说明（不报金额，只报奖级）：
+奖级说明（单式票只报奖级；复式票报各奖级注数和固定奖金合计，固定奖按官方标准）：
 - 双色球：6+1一等、6+0二等、5+1三等、5+0或4+1四等、4+0或3+1五等、
   2+1或1+1或0+1六等，取最高一等。
 - 大乐透：按 2026 年 2 月 1 日起实施的新规，9 个奖级合并为 7 个，
@@ -13,7 +14,9 @@
   4+0或3+2五等、3+1或2+2六等、3+0或2+1或1+2或0+2七等，取最高一等。
   以官方公告为准，如官方再改规则，请以官方公告为准、并联系作者更新。
 """
+import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -69,6 +72,19 @@ GAMES = {
                "main_name": "前区", "back_name": "后区", "org": "体彩",
                "draw_weekdays": [0, 2, 5]},  # 周一、三、六
 }
+CHANNEL_LABELS = {"bark": "Bark", "serverchan": "Server酱"}
+
+# 复式票展开上限：超过这么多注就拒绝，避免一次核对算太久。
+MAX_COMBO_TICKETS = 100000
+
+# 固定奖金（官方标准，奖池 8 亿以下；一/二等奖是浮动奖，不在这里算）。
+FIXED_PRIZES = {
+    "双色球": {"三等奖": 3000, "四等奖": 200, "五等奖": 10, "六等奖": 5},
+    "大乐透": {"三等奖": 5000, "四等奖": 300, "五等奖": 150, "六等奖": 15, "七等奖": 5},
+}
+
+TIER_ORDER = ["一等奖", "二等奖", "三等奖", "四等奖", "五等奖", "六等奖", "七等奖"]
+
 PUSH_TIME_OPTIONS = ["开奖后抓到就推", "21:30", "22:00", "22:30", "23:00", "自定义"]
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 MONITOR_LABELS = {"always": "一直守着", "count": "只对x期"}
@@ -166,10 +182,17 @@ def normalize_text(text):
 
 def parse_number_list(text, count, lo, hi, label):
     """返回排序后的 int 列表；填错时 raise ValueError，指明哪一项错了。"""
+    return parse_number_list_range(text, count, count, lo, hi, label)
+
+
+def parse_number_list_range(text, min_count, max_count, lo, hi, label):
+    """返回排序后的 int 列表；个数须在 [min_count, max_count] 内；填错时 raise ValueError。"""
     norm = normalize_text(text)
     parts = [p.strip() for p in re.split(r"[,\s;；]+", norm) if p.strip() != ""]
-    if len(parts) != count:
-        raise ValueError("%s应填 %d 个号码，你填了 %d 个：%s" % (label, count, len(parts), text))
+    if len(parts) < min_count or len(parts) > max_count:
+        if min_count == max_count:
+            raise ValueError("%s应填 %d 个号码，你填了 %d 个：%s" % (label, min_count, len(parts), text))
+        raise ValueError("%s应填 %d-%d 个号码，你填了 %d 个：%s" % (label, min_count, max_count, len(parts), text))
     nums = []
     for p in parts:
         if not re.fullmatch(r"\d+", p):
@@ -185,8 +208,11 @@ def parse_number_list(text, count, lo, hi, label):
 
 def validate_ticket(game, main_text, back_text):
     cfg = GAMES[game]
-    main = parse_number_list(main_text, cfg["main_count"], cfg["main_lo"], cfg["main_hi"], cfg["main_name"])
-    back = parse_number_list(back_text, cfg["back_count"], cfg["back_lo"], cfg["back_hi"], cfg["back_name"])
+    main = parse_number_list_range(main_text, cfg["main_count"], cfg["main_hi"], cfg["main_lo"], cfg["main_hi"], cfg["main_name"])
+    back = parse_number_list_range(back_text, cfg["back_count"], cfg["back_hi"], cfg["back_lo"], cfg["back_hi"], cfg["back_name"])
+    combos = math.comb(len(main), cfg["main_count"]) * math.comb(len(back), cfg["back_count"])
+    if combos > MAX_COMBO_TICKETS:
+        raise ValueError("这张票展开是 %d 注，超过 %d 注上限，请少选几个号码" % (combos, MAX_COMBO_TICKETS))
     return main, back
 
 
@@ -197,10 +223,11 @@ class BallPicker:
     只在有图形界面时使用；核心校验仍走 parse_number_list / validate_ticket。
     """
 
-    def __init__(self, parent, label, lo, hi, count, initial=()):
+    def __init__(self, parent, label, lo, hi, count, initial=(), on_change=None):
         self.lo = lo
         self.hi = hi
         self.count = count
+        self.on_change = on_change
         self.selected = set(int(x) for x in (initial or []) if lo <= int(x) <= hi)
         self.frame = ttk.Frame(parent)
         ttk.Label(self.frame, text=label).pack(anchor="w")
@@ -230,6 +257,11 @@ class BallPicker:
             else:
                 btn.configure(bg=self.default_bg or "", fg="black", relief="raised")
         self.count_label.configure(text="已选 %d / %d 个" % (len(self.selected), self.count))
+        if self.on_change:
+            try:
+                self.on_change()
+            except Exception:
+                pass
 
     def toggle(self, num):
         if num in self.selected:
@@ -299,6 +331,57 @@ def check_ticket(game, ticket, draw):
     if game == "双色球":
         return check_ssq(ticket["main"], ticket["back"], draw["main"], draw["back"])
     return check_dlt(ticket["main"], ticket["back"], draw["main"], draw["back"])
+
+
+def combo_count(game, ticket):
+    cfg = GAMES[game]
+    return math.comb(len(ticket["main"]), cfg["main_count"]) * math.comb(len(ticket["back"]), cfg["back_count"])
+
+
+def is_multi_ticket(game, ticket):
+    """号码个数超出单式就是复式，自动识别，不用另加字段。"""
+    cfg = GAMES[game]
+    return len(ticket["main"]) > cfg["main_count"] or len(ticket["back"]) > cfg["back_count"]
+
+
+def multi_ticket_label(game, ticket):
+    """复式票的显示：'7+2复式（21注，42元）'；单式票返回空字符串。"""
+    if not is_multi_ticket(game, ticket):
+        return ""
+    n = combo_count(game, ticket)
+    return "%d+%d复式（%d注，%d元）" % (len(ticket["main"]), len(ticket["back"]), n, n * 2)
+
+
+def check_multi_ticket(game, ticket, draw):
+    """把复式票展开成单注，逐注复用 check_ssq/check_dlt 判定，返回 {奖级: 注数}（只含中奖的）。"""
+    cfg = GAMES[game]
+    check = check_ssq if game == "双色球" else check_dlt
+    counts = {}
+    for m in itertools.combinations(ticket["main"], cfg["main_count"]):
+        for b in itertools.combinations(ticket["back"], cfg["back_count"]):
+            tier, _a, _b = check(list(m), list(b), draw["main"], draw["back"])
+            if tier:
+                counts[tier] = counts.get(tier, 0) + 1
+    return counts
+
+
+def fixed_prize_total(game, counts):
+    prizes = FIXED_PRIZES[game]
+    return sum(prizes.get(tier, 0) * n for tier, n in counts.items())
+
+
+def multi_breakdown_text(game, counts):
+    """复式票的中奖汇总文案，只用于复式票。例：'复式：三等奖×10、五等奖×10，固定奖金合计51500元'。"""
+    parts = ["%s×%d" % (tier, counts[tier]) for tier in TIER_ORDER if tier in counts]
+    text = "复式：" + "、".join(parts)
+    total = fixed_prize_total(game, counts)
+    if total > 0:
+        text += "，固定奖金合计%d元" % total
+    if "一等奖" in counts or "二等奖" in counts:
+        text += "；一/二等奖是浮动奖，浮动奖金以官方公告为准"
+    if game == "大乐透" and total > 0:
+        text += "；奖池8亿以上时固定奖更高，以官方公告为准"
+    return text
 
 
 def draw_text(game, draw):
@@ -650,8 +733,91 @@ def bark_push(key, title, body, timeout=10):
         raise get_err
 
 
+def _serverchan_check_response(text):
+    """Server酱返回 JSON 时 code 须为 0，否则抛返回异常；返回的不是 JSON 也算失败。"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError("Server酱返回异常：%s" % text[:200])
+    if data.get("code") != 0:
+        raise ValueError("Server酱返回异常：%s" % text[:200])
+
+
+def _serverchan_post(key, title, body, timeout=10, context=None):
+    payload = urllib.parse.urlencode({"title": title, "desp": body}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://sctapi.ftqq.com/%s.send" % key, data=payload,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+        text = resp.read().decode("utf-8", errors="ignore")
+    _serverchan_check_response(text)
+    return True
+
+
+def serverchan_push(key, title, body, timeout=10):
+    """Server酱推送：POST 表单到 https://sctapi.ftqq.com/{SendKey}.send，字段 title/desp，
+    返回 JSON 里 code==0 才算成功。标题最多 32 个字符，超了截断（只截 Server酱的，Bark 不动）。
+    第一招普通 POST；证书验证失败时，若本机装了 certifi，再用其 cacert 试一次。
+    成功时 serverchan_push.last_method 为 "POST"/"certifi-POST"，
+    serverchan_push.last_errors 记录各招的原始错误（不含 key）；全部失败时抛原始错误。
+    key 为空返回 False（不算失败，只是没填）。成功返回 True，失败抛异常。证书验证绝不关闭。
+    """
+    serverchan_push.last_method = ""
+    serverchan_push.last_errors = {}
+    if key is None:
+        return False
+    key = str(key).strip()
+    key = unicodedata.normalize("NFKC", key)
+    key = key.strip()
+    if not key:
+        return False
+    if re.search(r"\s", key):
+        raise ValueError("Server酱 SendKey 里有空格，请检查是不是多复制了空格")
+    title = str(title)[:32]
+    try:
+        _serverchan_post(key, title, body, timeout=timeout)
+        serverchan_push.last_method = "POST"
+        return True
+    except Exception as post_err:
+        serverchan_push.last_errors["POST"] = str(_bark_unwrap(post_err))
+        if not is_cert_error(_bark_unwrap(post_err)):
+            raise
+        # 证书失败才试 certifi 的 cacert（只在装了 certifi 时才试，装不上就跳过、不报错）
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception as certifi_err:
+            serverchan_push.last_errors["certifi"] = str(certifi_err)
+            raise post_err
+        try:
+            _serverchan_post(key, title, body, timeout=timeout, context=ctx)
+            serverchan_push.last_method = "certifi-POST"
+            return True
+        except Exception as certifi_post_err:
+            serverchan_push.last_errors["certifi-POST"] = str(_bark_unwrap(certifi_post_err))
+        raise post_err
+
+
+def channel_of(key_entry):
+    """密钥的推送通道；老密钥没有 channel 字段时一律按 Bark 处理。"""
+    ch = (key_entry or {}).get("channel") or "bark"
+    return ch if ch in CHANNEL_LABELS else "bark"
+
+
+def push_with_channel(channel, key, title, body, timeout=10):
+    """按通道推送，返回 (ok, method, last_errors)。"""
+    if channel == "serverchan":
+        ok = serverchan_push(key, title, body, timeout=timeout)
+        return ok, serverchan_push.last_method, serverchan_push.last_errors
+    ok = bark_push(key, title, body, timeout=timeout)
+    return ok, bark_push.last_method, bark_push.last_errors
+
+
 bark_push.last_method = ""
 bark_push.last_errors = {}
+serverchan_push.last_method = ""
+serverchan_push.last_errors = {}
 
 
 def load_json(path, default):
@@ -725,7 +891,10 @@ class App:
         try:
             while True:
                 item = self.test_result_queue.get_nowait()
-                if len(item) == 5:
+                if len(item) == 6:
+                    name, ok, err, is_cert, method, channel = item
+                    self._test_key_done(name, ok, err, is_cert, method, channel)
+                elif len(item) == 5:
                     name, ok, err, is_cert, method = item
                     self._test_key_done(name, ok, err, is_cert, method)
                 else:
@@ -788,6 +957,15 @@ class App:
                 return k["key"]
         return ""
 
+    def key_entry(self, key_id):
+        for k in self.settings["bark_keys"]:
+            if k["id"] == key_id:
+                return k
+        return None
+
+    def key_channel(self, key_id):
+        return channel_of(self.key_entry(key_id))
+
     def save_all(self):
         save_json(TICKETS_FILE, self.tickets)
         save_json(SETTINGS_FILE, self.settings)
@@ -831,11 +1009,11 @@ class App:
                   wraplength=950).pack(fill="x", padx=8, pady=4)
 
         # --- 密钥与设置 ---
-        ttk.Label(tab2, text="Bark 密钥管理（密钥只存在本软件同文件夹的设置文件里，日志里仍只记打码、不记完整 key）").pack(anchor="w", padx=8, pady=6)
+        ttk.Label(tab2, text="密钥管理：Bark 只能推 iPhone，Server酱走微信、安卓苹果都能收").pack(anchor="w", padx=8, pady=6)
         ttk.Label(tab2, text="密钥只存在你本机设置文件里，这里只显示前后各3位、中间打码，完整 key 不会在界面上显示出来。").pack(anchor="w", padx=8, pady=2)
-        kcols = ("name", "fullkey", "push_time", "id")
+        kcols = ("name", "channel", "fullkey", "push_time", "id")
         self.key_tree = ttk.Treeview(tab2, columns=kcols, show="headings", height=8)
-        for c, t, w in [("name", "名称", 160), ("fullkey", "密钥", 220), ("push_time", "推送时间", 160), ("id", "编号", 180)]:
+        for c, t, w in [("name", "名称", 160), ("channel", "通道", 80), ("fullkey", "密钥", 220), ("push_time", "推送时间", 160), ("id", "编号", 180)]:
             self.key_tree.heading(c, text=t)
             self.key_tree.column(c, width=w)
         self.key_tree.pack(fill="x", padx=8, pady=4)
@@ -865,7 +1043,7 @@ class App:
             self.rem_tree.heading(c, text=rheads[c])
             self.rem_tree.column(c, width=rwidths[c])
         self.rem_tree.pack(fill="both", expand=True, padx=8, pady=4)
-        ttk.Label(tab_rem, text="说明：每条提醒自选推送到哪个 Bark 密钥、勾选周几、设准确时间点（北京时间），到点推一次、当天不重复推。提醒只管到点推，不管你买没买。周五没有开奖，不想推就别勾周五。软件没开着的时候不推、不补推。",
+        ttk.Label(tab_rem, text="说明：每条提醒自选推送到哪个密钥、勾选周几、设准确时间点（北京时间），到点推一次、当天不重复推。提醒只管到点推，不管你买没买。周五没有开奖，不想推就别勾周五。软件没开着的时候不推、不补推。",
                   wraplength=950, justify="left").pack(fill="x", padx=8, pady=4)
 
         # --- 日志 ---
@@ -880,6 +1058,9 @@ class App:
             for t in self.tickets:
                 cfg = GAMES[t["game"]]
                 nums = "%s %s + %s %s" % (cfg["main_name"], fmt_nums(t["main"]), cfg["back_name"], fmt_nums(t["back"]))
+                _mlabel = multi_ticket_label(t["game"], t)
+                if _mlabel:
+                    nums += " " + _mlabel
                 if t["monitor"] == "count":
                     monitor = "只对%d期（还剩%d次）" % (int(t.get("count") or 1), int(t.get("remaining") if t.get("remaining") is not None else (t.get("count") or 1)))
                 else:
@@ -895,7 +1076,7 @@ class App:
             for row in self.key_tree.get_children():
                 self.key_tree.delete(row)
             for k in self.settings["bark_keys"]:
-                self.key_tree.insert("", "end", iid=k["id"], values=(k["name"], self.mask_key(k["key"]), key_push_time_display(k.get("push_time")), k["id"]))
+                self.key_tree.insert("", "end", iid=k["id"], values=(k["name"], CHANNEL_LABELS[channel_of(k)], self.mask_key(k["key"]), key_push_time_display(k.get("push_time")), k["id"]))
         except Exception:
             pass
 
@@ -925,7 +1106,7 @@ class App:
     def add_reminder_dialog(self, reminder=None):
         key_names = [k["name"] for k in self.settings["bark_keys"]]
         if not key_names and reminder is None:
-            messagebox.showwarning("提示", "还没有 Bark 密钥，请先到“密钥与设置”页添加一个，再回来加提醒。")
+            messagebox.showwarning("提示", "还没有密钥，请先到“密钥与设置”页添加一个，再回来加提醒。")
             return
         win = tk.Toplevel(self.root)
         win.title("修改购彩提醒" if reminder else "添加购彩提醒")
@@ -977,7 +1158,7 @@ class App:
                     key_id = k["id"]
                     break
             if not key_id:
-                messagebox.showerror("填错了", "推送密钥：请先在“密钥与设置”页添加 Bark 密钥，再回来选。")
+                messagebox.showerror("填错了", "推送密钥：请先在“密钥与设置”页添加密钥，再回来选。")
                 return
             tstr = "%s:%s" % (hour_var.get(), min_var.get())
             wd_txt = "、".join(WEEKDAY_NAMES[d] for d in sorted(weekdays))
@@ -1018,17 +1199,17 @@ class App:
         self.save_all()
         self.refresh_reminders()
 
-    def _do_reminder_push(self, key, key_name, text):
+    def _do_reminder_push(self, key, key_name, text, channel="bark"):
+        _fn = serverchan_push if channel == "serverchan" else bark_push
         try:
-            ok = bark_push(key, "购彩提醒", text)
-            method = getattr(bark_push, "last_method", "")
+            ok, method, _errs = push_with_channel(channel, key, "购彩提醒", text)
             method_txt = "（%s通了）" % method if method else ""
             self.log("购彩提醒推送：推送到=%s，结果=%s%s，文本=%s。" % (key_name, "成功" if ok else "失败", method_txt, text))
         except Exception as e:
             cause = e.reason if isinstance(e, urllib.error.URLError) and getattr(e, "reason", None) is not None else e
             if is_cert_error(cause):
                 self.log("购彩提醒推送失败：推送到=%s，%s。" % (key_name, CERT_HUMAN))
-                self.log_file_only("购彩提醒推送原始证书错误（只记文件）：原始错误=%s，各招原始错误=%s。" % (cause, getattr(bark_push, "last_errors", {})))
+                self.log_file_only("购彩提醒推送原始证书错误（只记文件）：原始错误=%s，各招原始错误=%s。" % (cause, getattr(_fn, "last_errors", {})))
             else:
                 self.log("购彩提醒推送失败：推送到=%s，原因：%s。" % (key_name, cause))
 
@@ -1054,7 +1235,7 @@ class App:
                         self.log("购彩提醒跳过：%s，密钥已不在。" % r.get("text", ""))
                         continue
                     threading.Thread(target=self._do_reminder_push,
-                                     args=(key, self.key_name(r.get("key_id", "")), r.get("text", "")), daemon=True).start()
+                                     args=(key, self.key_name(r.get("key_id", "")), r.get("text", ""), self.key_channel(r.get("key_id", ""))), daemon=True).start()
             except Exception:
                 pass
             for _ in range(30):
@@ -1098,6 +1279,25 @@ class App:
         picker_holder.pack(fill="both", expand=True)
         pickers = {}
 
+        def update_combo_label():
+            try:
+                game = game_var.get()
+                cfg = GAMES[game]
+                main = pickers["main"].get()
+                back = pickers["back"].get()
+                if len(main) < cfg["main_count"] or len(back) < cfg["back_count"]:
+                    combo_label.configure(text="注数：号码还没选够（%s至少%d个，%s至少%d个）" % (cfg["main_name"], cfg["main_count"], cfg["back_name"], cfg["back_count"]))
+                    return
+                n = math.comb(len(main), cfg["main_count"]) * math.comb(len(back), cfg["back_count"])
+                if n > MAX_COMBO_TICKETS:
+                    combo_label.configure(text="注数：%d 注，超过 %d 注上限，请少选几个号码" % (n, MAX_COMBO_TICKETS))
+                elif n == 1:
+                    combo_label.configure(text="注数：单式 1 注，2 元")
+                else:
+                    combo_label.configure(text="注数：%d+%d复式，%d 注，%d 元" % (len(main), len(back), n, n * 2))
+            except Exception:
+                pass
+
         def rebuild_pickers():
             for child in picker_holder.winfo_children():
                 child.destroy()
@@ -1105,19 +1305,22 @@ class App:
             cfg = GAMES[game]
             init_main = ticket["main"] if ticket and ticket["game"] == game else []
             init_back = ticket["back"] if ticket and ticket["game"] == game else []
-            pickers["main"] = BallPicker(picker_holder, "%s（点一下选中，再点取消，选满后不能再选）" % cfg["main_name"], cfg["main_lo"], cfg["main_hi"], cfg["main_count"], init_main)
+            pickers["main"] = BallPicker(picker_holder, "%s（点一下选中，再点取消，选满后不能再选）" % cfg["main_name"], cfg["main_lo"], cfg["main_hi"], cfg["main_hi"], init_main, on_change=update_combo_label)
             pickers["main"].pack(fill="x", pady=4)
-            pickers["back"] = BallPicker(picker_holder, "%s（点一下选中，再点取消，选满后不能再选）" % cfg["back_name"], cfg["back_lo"], cfg["back_hi"], cfg["back_count"], init_back)
+            pickers["back"] = BallPicker(picker_holder, "%s（点一下选中，再点取消，选满后不能再选）" % cfg["back_name"], cfg["back_lo"], cfg["back_hi"], cfg["back_hi"], init_back, on_change=update_combo_label)
             pickers["back"].pack(fill="x", pady=4)
-            main_hint.configure(text="%s：%d-%d 选 %d 个" % (cfg["main_name"], cfg["main_lo"], cfg["main_hi"], cfg["main_count"]))
-            back_hint.configure(text="%s：%d-%d 选 %d 个" % (cfg["back_name"], cfg["back_lo"], cfg["back_hi"], cfg["back_count"]))
+            main_hint.configure(text="%s：%d-%d 选 %d-%d 个，选多了就是复式" % (cfg["main_name"], cfg["main_lo"], cfg["main_hi"], cfg["main_count"], cfg["main_hi"]))
+            back_hint.configure(text="%s：%d-%d 选 %d-%d 个，选多了就是复式" % (cfg["back_name"], cfg["back_lo"], cfg["back_hi"], cfg["back_count"], cfg["back_hi"]))
+            update_combo_label()
 
         main_hint = ttk.Label(content, text="")
         back_hint = ttk.Label(content, text="")
+        combo_label = ttk.Label(content, text="")
         # 先建占位，再由 rebuild 填充；提示行放在选择器下方
         rebuild_pickers()
         main_hint.pack(anchor="w")
         back_hint.pack(anchor="w")
+        combo_label.pack(anchor="w")
         game_combo = content.winfo_children()[1] if len(content.winfo_children()) > 1 else None
         # 彩种切换时重建小球（改票回显只在同彩种时保留）
         try:
@@ -1138,7 +1341,7 @@ class App:
         ttk.Combobox(content, textvariable=mode_var, values=list(MODE_LABELS.values()), state="readonly").pack(anchor="w", fill="x")
         ttk.Label(content, text="仅推开奖号模式是给随机机打的票手动核对用的，只推开奖号，不报中没中。").pack(anchor="w", pady=2)
         if not key_names:
-            ttk.Label(content, text="还没有 Bark 密钥，请先到“密钥与设置”页添加一个，再回来加票。").pack(anchor="w", pady=6)
+            ttk.Label(content, text="还没有密钥，请先到“密钥与设置”页添加一个，再回来加票。").pack(anchor="w", pady=6)
         else:
             ttk.Label(content, text="推送到哪个密钥（鼠标点选）").pack(anchor="w", pady=2)
             ttk.Combobox(content, textvariable=key_var, values=key_names, state="readonly").pack(anchor="w", fill="x")
@@ -1151,11 +1354,15 @@ class App:
             cfg = GAMES[game]
             main = pickers["main"].get()
             back = pickers["back"].get()
-            if len(main) != cfg["main_count"]:
-                messagebox.showerror("填错了", "%s应选 %d 个，你只选了 %d 个，还差 %d 个，请点小球补齐再保存，该条暂不保存。" % (cfg["main_name"], cfg["main_count"], len(main), cfg["main_count"] - len(main)))
+            if len(main) < cfg["main_count"]:
+                messagebox.showerror("填错了", "%s至少选 %d 个，你只选了 %d 个，还差 %d 个，请点小球补齐再保存，该条暂不保存。" % (cfg["main_name"], cfg["main_count"], len(main), cfg["main_count"] - len(main)))
                 return
-            if len(back) != cfg["back_count"]:
-                messagebox.showerror("填错了", "%s应选 %d 个，你只选了 %d 个，还差 %d 个，请点小球补齐再保存，该条暂不保存。" % (cfg["back_name"], cfg["back_count"], len(back), cfg["back_count"] - len(back)))
+            if len(back) < cfg["back_count"]:
+                messagebox.showerror("填错了", "%s至少选 %d 个，你只选了 %d 个，还差 %d 个，请点小球补齐再保存，该条暂不保存。" % (cfg["back_name"], cfg["back_count"], len(back), cfg["back_count"] - len(back)))
+                return
+            combos = math.comb(len(main), cfg["main_count"]) * math.comb(len(back), cfg["back_count"])
+            if combos > MAX_COMBO_TICKETS:
+                messagebox.showerror("填错了", "这张票展开是 %d 注，超过 %d 注上限，请少选几个号码再保存，该条暂不保存。" % (combos, MAX_COMBO_TICKETS))
                 return
             monitor = MONITOR_FROM_LABEL.get(monitor_var.get(), "always")
             try:
@@ -1177,9 +1384,11 @@ class App:
                     key_id = k["id"]
                     break
             if not key_id:
-                messagebox.showerror("填错了", "推送密钥：请先在“密钥与设置”页添加 Bark 密钥，再回来选。")
+                messagebox.showerror("填错了", "推送密钥：请先在“密钥与设置”页添加密钥，再回来选。")
                 return
             _monitor_text = MONITOR_LABELS[monitor] if monitor == "always" else "只对%d期（还剩%d次）" % (count, remaining)
+            _mlabel = multi_ticket_label(game, {"main": main, "back": back})
+            _nums_suffix = ("，" + _mlabel) if _mlabel else ""
             if ticket is None:
                 new_id = int(time.time() * 1000)
                 self.tickets.append({"id": new_id, "game": game, "main": main, "back": back,
@@ -1187,13 +1396,13 @@ class App:
                                      "remaining": remaining, "mode": mode,
                                      "key_id": key_id, "status": "active", "last_result": "",
                                      "pushed": []})
-                self.log("添加彩票：%s %s + %s，监控=%s，模式=%s，推送到=%s。" % (game, fmt_nums(main), fmt_nums(back), _monitor_text, MODE_LABELS[mode], key_var.get()))
+                self.log("添加彩票：%s %s + %s%s，监控=%s，模式=%s，推送到=%s。" % (game, fmt_nums(main), fmt_nums(back), _nums_suffix, _monitor_text, MODE_LABELS[mode], key_var.get()))
             else:
                 ticket.update({"game": game, "main": main, "back": back, "monitor": monitor,
                                "count": count if monitor == "count" else 0, "remaining": remaining,
                                "mode": mode, "key_id": key_id})
                 ticket.pop("issue", None)
-                self.log("修改彩票：%s %s + %s，监控=%s，模式=%s，推送到=%s。" % (game, fmt_nums(main), fmt_nums(back), _monitor_text, MODE_LABELS[mode], key_var.get()))
+                self.log("修改彩票：%s %s + %s%s，监控=%s，模式=%s，推送到=%s。" % (game, fmt_nums(main), fmt_nums(back), _nums_suffix, _monitor_text, MODE_LABELS[mode], key_var.get()))
             self.save_all()
             self.refresh_tickets()
             win.destroy()
@@ -1226,11 +1435,12 @@ class App:
     # ----- 密钥 -----
     def add_key_dialog(self, key_entry=None):
         win = tk.Toplevel(self.root)
-        win.title("修改 Bark 密钥" if key_entry else "添加 Bark 密钥")
+        win.title("修改密钥" if key_entry else "添加密钥")
         win.geometry("640x520")
         win.minsize(620, 420)
         name_var = tk.StringVar(value=key_entry["name"] if key_entry else "")
         key_var = tk.StringVar()
+        channel_var = tk.StringVar(value=CHANNEL_LABELS[channel_of(key_entry)] if key_entry else "Bark")
         _saved = str(key_entry.get("push_time") or "开奖后抓到就推") if key_entry else "开奖后抓到就推"
         _is_custom = is_custom_push_time(_saved)
         _ch, _cm = split_custom_push_time(_saved)
@@ -1245,11 +1455,13 @@ class App:
         content.pack(side="top", fill="both", expand=True, padx=12, pady=8)
         ttk.Label(content, text="名称（比如：我的手机）").pack(anchor="w", pady=2)
         ttk.Entry(content, textvariable=name_var).pack(fill="x", pady=2)
+        ttk.Label(content, text="通道（鼠标点选：Bark 只能推 iPhone；Server酱走微信，安卓苹果都能收）").pack(anchor="w", pady=2)
+        ttk.Combobox(content, textvariable=channel_var, values=list(CHANNEL_LABELS.values()), state="readonly").pack(anchor="w", fill="x")
         ttk.Label(content, text="密钥（只存在本机设置文件里，输完保存后列表里只显示前后各3位）").pack(anchor="w", pady=2)
         ttk.Entry(content, textvariable=key_var).pack(fill="x", pady=2)
-        ttk.Label(content, text="密钥只存在你本机设置文件里，请不要把完整 key 发在聊天里。", wraplength=600).pack(anchor="w", pady=2)
+        ttk.Label(content, text="Bark key 在 iPhone 的 Bark App 里复制；Server酱 SendKey 去 sct.ftqq.com 微信扫码登录后拿。密钥只存在你本机设置文件里，请不要把完整 key 发在聊天里。", wraplength=600).pack(anchor="w", pady=2)
         if key_entry:
-            ttk.Label(content, text="修改时密钥留空就是不改密钥，只改名称和推送时间。").pack(anchor="w", pady=2)
+            ttk.Label(content, text="修改时密钥留空就是不改密钥，只改名称、通道和推送时间。").pack(anchor="w", pady=2)
         ttk.Label(content, text="这个密钥几点推送（北京时间，鼠标点选，以后在修改里随时能改）").pack(anchor="w", pady=6)
         push_combo = ttk.Combobox(content, textvariable=push_time_var, values=PUSH_TIME_OPTIONS, state="readonly")
         push_combo.pack(anchor="w", fill="x")
@@ -1273,6 +1485,7 @@ class App:
         def on_save():
             name = name_var.get().strip()
             key = key_var.get().strip()
+            channel = "serverchan" if channel_var.get() == CHANNEL_LABELS["serverchan"] else "bark"
             if push_time_var.get() == "自定义":
                 push_time = "%s:%s" % (custom_hour_var.get(), custom_min_var.get())
             else:
@@ -1287,14 +1500,15 @@ class App:
                 messagebox.showerror("填错了", "这个名称已经用过了，请换一个名称。")
                 return
             if key_entry is None:
-                self.settings["bark_keys"].append({"id": str(int(time.time() * 1000)), "name": name, "key": key, "push_time": push_time})
-                self.log("添加 Bark 密钥：名称=%s，推送时间=%s（密钥已打码，不记日志）。" % (name, push_time))
+                self.settings["bark_keys"].append({"id": str(int(time.time() * 1000)), "name": name, "key": key, "channel": channel, "push_time": push_time})
+                self.log("添加密钥：名称=%s，通道=%s，推送时间=%s（密钥已打码，不记日志）。" % (name, CHANNEL_LABELS[channel], push_time))
             else:
                 key_entry["name"] = name
+                key_entry["channel"] = channel
                 key_entry["push_time"] = push_time
                 if key:
                     key_entry["key"] = key
-                self.log("修改 Bark 密钥：名称=%s，推送时间=%s（密钥已打码，不记日志）。" % (name, push_time))
+                self.log("修改密钥：名称=%s，通道=%s，推送时间=%s（密钥已打码，不记日志）。" % (name, CHANNEL_LABELS[channel], push_time))
             self.save_all()
             self.refresh_keys()
             win.destroy()
@@ -1328,7 +1542,7 @@ class App:
         self.settings["bark_keys"] = [k for k in self.settings["bark_keys"] if k["id"] != kid]
         self.save_all()
         self.refresh_keys()
-        self.log("删除 Bark 密钥一个（名称不记全称，密钥不记日志）。")
+        self.log("删除密钥一个（名称不记全称，密钥不记日志）。")
 
     def key_push_time(self, key_id):
         for k in self.settings["bark_keys"]:
@@ -1344,52 +1558,59 @@ class App:
         kid = sel[0]
         name = self.key_name(kid)
         key = self.key_value(kid)
+        channel = self.key_channel(kid)
         self.test_status_label.configure(text="测试状态：正在测试“%s”，请稍等，结果马上会在这里显示并弹出来……" % name)
-        self.log("测试 Bark 密钥：%s，正在后台推送测试消息……" % name)
-        threading.Thread(target=self._test_key_worker, args=(kid, name, key), daemon=True).start()
+        self.log("测试密钥：%s，正在后台推送测试消息……" % name)
+        threading.Thread(target=self._test_key_worker, args=(kid, name, key, channel), daemon=True).start()
 
-    def _test_key_worker(self, kid, name, key):
+    def _test_key_worker(self, kid, name, key, channel="bark"):
         ok = False
         err = ""
         is_cert = False
         method = ""
+        _fn = serverchan_push if channel == "serverchan" else bark_push
         try:
-            ok = bool(bark_push(key, "彩票小软件测试", "Bark密钥测试成功，密钥名称：%s" % name))
-            method = getattr(bark_push, "last_method", "")
+            if channel == "serverchan":
+                body = "Server酱测试成功，密钥名称：%s" % name
+            else:
+                body = "Bark密钥测试成功，密钥名称：%s" % name
+            ok, method, _errs = push_with_channel(channel, key, "彩票小软件测试", body)
+            ok = bool(ok)
             if not ok:
                 err = "对方返回的不是成功结果"
         except Exception as e:
             cause = e.reason if isinstance(e, urllib.error.URLError) and getattr(e, "reason", None) is not None else e
             is_cert = is_cert_error(cause)
             err = str(cause)
-            method = getattr(bark_push, "last_method", "")
-            # GET/POST/certifi 的原始错误只记日志文件，不弹界面、不记 key
+            method = getattr(_fn, "last_method", "")
+            # 各招的原始错误只记日志文件，不弹界面、不记 key
             try:
-                self.log_file_only("测试 Bark 密钥各招原始错误（只记文件）：%s，%s。" % (name, getattr(bark_push, "last_errors", {})))
+                self.log_file_only("测试密钥各招原始错误（只记文件）：%s，%s。" % (name, getattr(_fn, "last_errors", {})))
             except Exception:
                 pass
         # 只把结果放进队列，不在这里直接弹框；主线程轮询时会弹框。
-        self.test_result_queue.put((name, ok, err, is_cert, method))
+        self.test_result_queue.put((name, ok, err, is_cert, method, channel))
 
-    def _test_key_done(self, name, ok, err, is_cert=False, method=""):
+    def _test_key_done(self, name, ok, err, is_cert=False, method="", channel="bark"):
         stamp = fmt_time()
+        test_label = "测试 Bark 密钥" if channel == "bark" else "测试 Server酱密钥"
         if ok:
             method_txt = "（%s通了）" % method if method else ""
             status = "测试状态：%s，“%s”测试成功%s，手机应该收到一条测试推送。" % (stamp, name, method_txt)
             self.test_status_label.configure(text=status)
-            self.log("测试 Bark 密钥：%s，结果=成功%s。" % (name, method_txt))
+            self.log("%s：%s，结果=成功%s。" % (test_label, name, method_txt))
             messagebox.showinfo("测试成功", "测试成功%s，手机应该收到一条测试推送。" % method_txt)
         elif is_cert:
             status = "测试状态：%s，“%s”%s。" % (stamp, name, CERT_HUMAN)
             self.test_status_label.configure(text=status)
-            self.log("测试 Bark 密钥：%s，结果=%s。" % (name, CERT_HUMAN))
-            self.log_file_only("测试 Bark 密钥原始证书错误（只记文件，不弹界面）：%s，原始错误=%s。" % (name, err))
+            self.log("%s：%s，结果=%s。" % (test_label, name, CERT_HUMAN))
+            self.log_file_only("%s原始证书错误（只记文件，不弹界面）：%s，原始错误=%s。" % (test_label, name, err))
             messagebox.showerror("测试失败", CERT_HUMAN)
         else:
             reason = ("，原因：%s" % err) if err else ""
             status = "测试状态：%s，“%s”测试失败，请检查密钥是否填对%s。" % (stamp, name, reason)
             self.test_status_label.configure(text=status)
-            self.log("测试 Bark 密钥：%s，结果=失败%s。" % (name, reason))
+            self.log("%s：%s，结果=失败%s。" % (test_label, name, reason))
             messagebox.showerror("测试失败", "测试失败，请检查密钥是否填对%s。" % reason)
 
     # ----- 手动核对 -----
@@ -1498,10 +1719,21 @@ class App:
             # 核对模式：一个密钥一组，只推一条汇总
             if check_tickets:
                 results = []
+                breakdowns = []
                 for t in check_tickets:
-                    tier, _a, _b = check_ticket(game, t, draw)
+                    if is_multi_ticket(game, t):
+                        counts = check_multi_ticket(game, t, draw)
+                        tier = next((x for x in TIER_ORDER if x in counts), None)
+                        if counts:
+                            result_text = multi_breakdown_text(game, counts)
+                            breakdowns.append(result_text)
+                        else:
+                            result_text = "没中"
+                    else:
+                        tier, _a, _b = check_ticket(game, t, draw)
+                        result_text = tier if tier else "没中"
                     results.append((tier,))
-                    t["last_result"] = "%s期：%s" % (issue, tier if tier else "没中")
+                    t["last_result"] = "%s期：%s" % (issue, result_text)
                     if t["monitor"] == "count":
                         remaining = max(0, int(t.get("remaining") if t.get("remaining") is not None else (t.get("count") or 1)) - 1)
                         t["remaining"] = remaining
@@ -1509,8 +1741,10 @@ class App:
                             t["status"] = "stopped"
                             self.log("只对x期已完成：%s第%s期票已跑满自动停止。" % (game, issue))
                     t.setdefault("pushed", []).append(issue)
-                    self.log("核对结果：%s %s + %s，%s期，%s。" % (game, fmt_nums(t["main"]), fmt_nums(t["back"]), issue, tier if tier else "没中"))
+                    self.log("核对结果：%s %s + %s，%s期，%s。" % (game, fmt_nums(t["main"]), fmt_nums(t["back"]), issue, result_text))
                 text, _win = build_check_texts(game, issue, dstr, results, draw_date)
+                for bd in breakdowns:
+                    text += " " + bd
                 title = "彩票开奖：%s" % draw_prefix(game, issue, draw_date)
                 self.deliver(game, issue, key_id, key, key_name, title, text, manual)
             # 仅推开奖号模式：一个密钥一组，只推一条开奖号，不报中没中
@@ -1533,8 +1767,9 @@ class App:
     def deliver(self, game, issue, key_id, key, key_name, title, text, manual):
         """manual=True 立即推；否则按该票所选密钥的推送时间：抓到就推立即推，固定时间做成待执行任务。"""
         push_time = self.key_push_time(key_id)
+        channel = self.key_channel(key_id)
         if manual or push_time == "开奖后抓到就推":
-            threading.Thread(target=self.do_push, args=(key, key_name, title, text, game, issue), daemon=True).start()
+            threading.Thread(target=self.do_push, args=(key, key_name, title, text, game, issue, channel), daemon=True).start()
             return
         # 固定时间：做成待执行任务
         target = push_time
@@ -1543,7 +1778,7 @@ class App:
             hh, mm = target.split(":")
             target_dt = datetime(today.year, today.month, today.day, int(hh), int(mm), tzinfo=BJ)
         except Exception:
-            threading.Thread(target=self.do_push, args=(key, key_name, title, text, game, issue), daemon=True).start()
+            threading.Thread(target=self.do_push, args=(key, key_name, title, text, game, issue, channel), daemon=True).start()
             return
         task = {"game": game, "issue": issue, "key_id": key_id, "key_name": key_name,
                 "title": title, "text": text, "target": target_dt.strftime("%Y-%m-%d %H:%M:%S")}
@@ -1552,19 +1787,20 @@ class App:
         self.save_all()
         self.log("待执行推送：%s第%s期，推送到=%s，设定点=%s（北京时间），到了点再推；若数据是到了点之后才抓到的，会直接补推。" % (game, issue, key_name, target))
 
-    def do_push(self, key, key_name, title, text, game, issue):
+    def do_push(self, key, key_name, title, text, game, issue, channel="bark"):
+        label = "Bark 推送" if channel == "bark" else "Server酱推送"
+        _fn = serverchan_push if channel == "serverchan" else bark_push
         try:
-            ok = bark_push(key, title, text)
-            method = getattr(bark_push, "last_method", "")
+            ok, method, _errs = push_with_channel(channel, key, title, text)
             method_txt = "（%s通了）" % method if method else ""
-            self.log("Bark 推送：%s第%s期，推送到=%s，结果=%s%s，文本=%s。" % (game, issue, key_name, "成功" if ok else "失败", method_txt, text))
+            self.log("%s：%s第%s期，推送到=%s，结果=%s%s，文本=%s。" % (label, game, issue, key_name, "成功" if ok else "失败", method_txt, text))
         except Exception as e:
             cause = e.reason if isinstance(e, urllib.error.URLError) and getattr(e, "reason", None) is not None else e
             if is_cert_error(cause):
-                self.log("Bark 推送失败：%s第%s期，推送到=%s，%s。" % (game, issue, key_name, CERT_HUMAN))
-                self.log_file_only("Bark 推送原始证书错误（只记文件）：%s第%s期，原始错误=%s，各招原始错误=%s。" % (game, issue, cause, getattr(bark_push, "last_errors", {})))
+                self.log("%s失败：%s第%s期，推送到=%s，%s。" % (label, game, issue, key_name, CERT_HUMAN))
+                self.log_file_only("%s原始证书错误（只记文件）：%s第%s期，原始错误=%s，各招原始错误=%s。" % (label, game, issue, cause, getattr(_fn, "last_errors", {})))
             else:
-                self.log("Bark 推送失败：%s第%s期，推送到=%s，原因：%s（下次再试，不卡界面）。" % (game, issue, key_name, cause))
+                self.log("%s失败：%s第%s期，推送到=%s，原因：%s（下次再试，不卡界面）。" % (label, game, issue, key_name, cause))
 
     # ----- 后台轮询（v1.6：只在开奖日晚上抓，抓到就停，22:00 抓不到就停，22:10 推失败提醒） -----
     def _is_new_issue(self, game, issue):
@@ -1577,17 +1813,18 @@ class App:
                 return False
         return True
 
-    def _do_fetch_failure_push(self, key, key_name, game):
+    def _do_fetch_failure_push(self, key, key_name, game, channel="bark"):
         title = "彩票开奖%s" % game
         body = "%s获取今日开奖信息失败，请手动尝试。" % game
+        _fn = serverchan_push if channel == "serverchan" else bark_push
         try:
-            ok = bark_push(key, title, body)
+            ok, _method, _errs = push_with_channel(channel, key, title, body)
             self.log("开奖失败提醒：%s，推送到=%s，结果=%s，文本=%s。" % (game, key_name, "成功" if ok else "失败", body))
         except Exception as e:
             cause = e.reason if isinstance(e, urllib.error.URLError) and getattr(e, "reason", None) is not None else e
             if is_cert_error(cause):
                 self.log("开奖失败提醒失败：%s，推送到=%s，%s。" % (game, key_name, CERT_HUMAN))
-                self.log_file_only("开奖失败提醒原始证书错误（只记文件）：%s，原始错误=%s，各招原始错误=%s。" % (game, cause, getattr(bark_push, "last_errors", {})))
+                self.log_file_only("开奖失败提醒原始证书错误（只记文件）：%s，原始错误=%s，各招原始错误=%s。" % (game, cause, getattr(_fn, "last_errors", {})))
             else:
                 self.log("开奖失败提醒失败：%s，推送到=%s，原因：%s。" % (game, key_name, cause))
 
@@ -1603,7 +1840,7 @@ class App:
             if not key:
                 continue
             threading.Thread(target=self._do_fetch_failure_push,
-                             args=(key, self.key_name(key_id), game), daemon=True).start()
+                             args=(key, self.key_name(key_id), game, self.key_channel(key_id)), daemon=True).start()
 
     def poll_loop(self):
         while not self.stop_flag:
@@ -1679,7 +1916,7 @@ class App:
                     if now >= target:
                         key = self.key_value(task.get("key_id", ""))
                         if key:
-                            threading.Thread(target=self.do_push, args=(key, task["key_name"], task["title"], task["text"], task["game"], task["issue"]), daemon=True).start()
+                            threading.Thread(target=self.do_push, args=(key, task["key_name"], task["title"], task["text"], task["game"], task["issue"], self.key_channel(task.get("key_id", ""))), daemon=True).start()
                         else:
                             self.log("待执行推送跳过：%s第%s期，密钥已不在。" % (task["game"], task["issue"]))
                     else:

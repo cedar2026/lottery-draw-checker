@@ -2,6 +2,7 @@
 settings.json
 tickets.json
 pending_tasks.json
+彩票小软件日志.txt
 *.log
 
 # Python

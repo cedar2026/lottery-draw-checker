@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""彩票小软件 agent 版：命令行工具（lottery_cli.py）。
+"""彩票小软件 agent 版 v1.10：命令行工具（lottery_cli.py）。
 
 给智能体（agent）用的版本：没有界面，一条命令跑完就退，不常驻后台。
 智能体靠自己的定时任务到点调它，定时任务由智能体平台管理，重启了还在；
@@ -10,17 +10,25 @@
 
 只用 Python 标准库。时间一律北京时间（固定 UTC+8，不用 ZoneInfo）。
 
+v1.10 改动：1）新增 Server酱推送通道：密钥多一个 channel 字段（bark/serverchan），
+老密钥没有该字段时按 Bark 处理；Server酱走微信，安卓手机也能收到推送；
+2）支持复式票：号码个数超出单式就是复式，程序自动展开成单注核对、汇总各奖级注数，
+固定奖金按官方标准合计，一/二等奖浮动奖只报注数。
+
 用法：
   python lottery_cli.py check                        # 抓最新一期、核对、推送（定时任务调这个）
   python lottery_cli.py remind                       # 推送到点的购彩提醒（定时任务调这个）
   python lottery_cli.py test --key-name 我的手机     # 给指定密钥发一条测试推送（配好后必须跑一次验货）
-  python lottery_cli.py add-key --name 我的手机 --key <Bark key>
+  python lottery_cli.py add-key --name 我的手机 --key <Bark key> [--channel bark|serverchan]
   python lottery_cli.py add-ticket --game 双色球 --main 09,15,18,25,26,28 --back 09 --key-name 我的手机
+  python lottery_cli.py add-ticket --game 大乐透 --main 01,02,03,04,05,06,07 --back 02,08 --key-name 我的手机  # 复式：7+2
   python lottery_cli.py add-reminder --text 记得买彩票 --key-name 我的手机 --weekdays 0,2,5 --time 18:00
   python lottery_cli.py list                         # 列出密钥（打码）和彩票
 """
 import argparse
+import itertools
 import json
+import math
 import os
 import re
 import ssl
@@ -77,6 +85,19 @@ GAMES = {
                "main_name": "前区", "back_name": "后区", "org": "体彩",
                "draw_weekdays": [0, 2, 5]},  # 周一、三、六
 }
+
+CHANNEL_LABELS = {"bark": "Bark", "serverchan": "Server酱"}
+
+# 复式票展开上限：超过这么多注就拒绝，避免一次核对算太久。
+MAX_COMBO_TICKETS = 100000
+
+# 固定奖金（官方标准，奖池 8 亿以下；一/二等奖是浮动奖，不在这里算）。
+FIXED_PRIZES = {
+    "双色球": {"三等奖": 3000, "四等奖": 200, "五等奖": 10, "六等奖": 5},
+    "大乐透": {"三等奖": 5000, "四等奖": 300, "五等奖": 150, "六等奖": 15, "七等奖": 5},
+}
+
+TIER_ORDER = ["一等奖", "二等奖", "三等奖", "四等奖", "五等奖", "六等奖", "七等奖"]
 
 PUSH_TIME_OPTIONS = ["开奖后抓到就推", "21:30", "22:00", "22:30", "23:00", "自定义"]
 
@@ -147,10 +168,17 @@ def normalize_text(text):
 
 def parse_number_list(text, count, lo, hi, label):
     """返回排序后的 int 列表；填错时 raise ValueError，指明哪一项错了。"""
+    return parse_number_list_range(text, count, count, lo, hi, label)
+
+
+def parse_number_list_range(text, min_count, max_count, lo, hi, label):
+    """返回排序后的 int 列表；个数须在 [min_count, max_count] 内；填错时 raise ValueError。"""
     norm = normalize_text(text)
     parts = [p.strip() for p in re.split(r"[,\s;；]+", norm) if p.strip() != ""]
-    if len(parts) != count:
-        raise ValueError("%s应填 %d 个号码，你填了 %d 个：%s" % (label, count, len(parts), text))
+    if len(parts) < min_count or len(parts) > max_count:
+        if min_count == max_count:
+            raise ValueError("%s应填 %d 个号码，你填了 %d 个：%s" % (label, min_count, len(parts), text))
+        raise ValueError("%s应填 %d-%d 个号码，你填了 %d 个：%s" % (label, min_count, max_count, len(parts), text))
     nums = []
     for p in parts:
         if not re.fullmatch(r"\d+", p):
@@ -163,10 +191,14 @@ def parse_number_list(text, count, lo, hi, label):
         raise ValueError("%s里有重复号码：%s" % (label, text))
     return sorted(nums)
 
+
 def validate_ticket(game, main_text, back_text):
     cfg = GAMES[game]
-    main = parse_number_list(main_text, cfg["main_count"], cfg["main_lo"], cfg["main_hi"], cfg["main_name"])
-    back = parse_number_list(back_text, cfg["back_count"], cfg["back_lo"], cfg["back_hi"], cfg["back_name"])
+    main = parse_number_list_range(main_text, cfg["main_count"], cfg["main_hi"], cfg["main_lo"], cfg["main_hi"], cfg["main_name"])
+    back = parse_number_list_range(back_text, cfg["back_count"], cfg["back_hi"], cfg["back_lo"], cfg["back_hi"], cfg["back_name"])
+    combos = math.comb(len(main), cfg["main_count"]) * math.comb(len(back), cfg["back_count"])
+    if combos > MAX_COMBO_TICKETS:
+        raise ValueError("这张票展开是 %d 注，超过 %d 注上限，请少选几个号码" % (combos, MAX_COMBO_TICKETS))
     return main, back
 
 def check_ssq(ticket_main, ticket_back, draw_main, draw_back):
@@ -211,6 +243,57 @@ def check_ticket(game, ticket, draw):
     if game == "双色球":
         return check_ssq(ticket["main"], ticket["back"], draw["main"], draw["back"])
     return check_dlt(ticket["main"], ticket["back"], draw["main"], draw["back"])
+
+
+def combo_count(game, ticket):
+    cfg = GAMES[game]
+    return math.comb(len(ticket["main"]), cfg["main_count"]) * math.comb(len(ticket["back"]), cfg["back_count"])
+
+
+def is_multi_ticket(game, ticket):
+    """号码个数超出单式就是复式，自动识别，不用另加字段。"""
+    cfg = GAMES[game]
+    return len(ticket["main"]) > cfg["main_count"] or len(ticket["back"]) > cfg["back_count"]
+
+
+def multi_ticket_label(game, ticket):
+    """复式票的显示：'7+2复式（21注，42元）'；单式票返回空字符串。"""
+    if not is_multi_ticket(game, ticket):
+        return ""
+    n = combo_count(game, ticket)
+    return "%d+%d复式（%d注，%d元）" % (len(ticket["main"]), len(ticket["back"]), n, n * 2)
+
+
+def check_multi_ticket(game, ticket, draw):
+    """把复式票展开成单注，逐注复用 check_ssq/check_dlt 判定，返回 {奖级: 注数}（只含中奖的）。"""
+    cfg = GAMES[game]
+    check = check_ssq if game == "双色球" else check_dlt
+    counts = {}
+    for m in itertools.combinations(ticket["main"], cfg["main_count"]):
+        for b in itertools.combinations(ticket["back"], cfg["back_count"]):
+            tier, _a, _b = check(list(m), list(b), draw["main"], draw["back"])
+            if tier:
+                counts[tier] = counts.get(tier, 0) + 1
+    return counts
+
+
+def fixed_prize_total(game, counts):
+    prizes = FIXED_PRIZES[game]
+    return sum(prizes.get(tier, 0) * n for tier, n in counts.items())
+
+
+def multi_breakdown_text(game, counts):
+    """复式票的中奖汇总文案，只用于复式票。例：'复式：三等奖×10、五等奖×10，固定奖金合计51500元'。"""
+    parts = ["%s×%d" % (tier, counts[tier]) for tier in TIER_ORDER if tier in counts]
+    text = "复式：" + "、".join(parts)
+    total = fixed_prize_total(game, counts)
+    if total > 0:
+        text += "，固定奖金合计%d元" % total
+    if "一等奖" in counts or "二等奖" in counts:
+        text += "；一/二等奖是浮动奖，浮动奖金以官方公告为准"
+    if game == "大乐透" and total > 0:
+        text += "；奖池8亿以上时固定奖更高，以官方公告为准"
+    return text
 
 def draw_text(game, draw):
     cfg = GAMES[game]
@@ -540,6 +623,88 @@ def bark_push(key, title, body, timeout=10):
         # 全部失败：抛原始 GET 错误，不要把 POST 的错误覆盖掉它
         raise get_err
 
+
+def _serverchan_check_response(text):
+    """Server酱返回 JSON 时 code 须为 0，否则抛返回异常；返回的不是 JSON 也算失败。"""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError("Server酱返回异常：%s" % text[:200])
+    if data.get("code") != 0:
+        raise ValueError("Server酱返回异常：%s" % text[:200])
+
+
+def _serverchan_post(key, title, body, timeout=10, context=None):
+    payload = urllib.parse.urlencode({"title": title, "desp": body}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://sctapi.ftqq.com/%s.send" % key, data=payload,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+        text = resp.read().decode("utf-8", errors="ignore")
+    _serverchan_check_response(text)
+    return True
+
+
+def serverchan_push(key, title, body, timeout=10):
+    """Server酱推送：POST 表单到 https://sctapi.ftqq.com/{SendKey}.send，字段 title/desp，
+    返回 JSON 里 code==0 才算成功。标题最多 32 个字符，超了截断（只截 Server酱的，Bark 不动）。
+    第一招普通 POST；证书验证失败时，若本机装了 certifi，再用其 cacert 试一次。
+    成功时 serverchan_push.last_method 为 "POST"/"certifi-POST"，
+    serverchan_push.last_errors 记录各招的原始错误（不含 key）；全部失败时抛原始错误。
+    key 为空返回 False（不算失败，只是没填）。成功返回 True，失败抛异常。证书验证绝不关闭。
+    """
+    serverchan_push.last_method = ""
+    serverchan_push.last_errors = {}
+    if key is None:
+        return False
+    key = str(key).strip()
+    key = unicodedata.normalize("NFKC", key)
+    key = key.strip()
+    if not key:
+        return False
+    if re.search(r"\s", key):
+        raise ValueError("Server酱 SendKey 里有空格，请检查是不是多复制了空格")
+    title = str(title)[:32]
+    try:
+        _serverchan_post(key, title, body, timeout=timeout)
+        serverchan_push.last_method = "POST"
+        return True
+    except Exception as post_err:
+        serverchan_push.last_errors["POST"] = str(_bark_unwrap(post_err))
+        if not is_cert_error(_bark_unwrap(post_err)):
+            raise
+        # 证书失败才试 certifi 的 cacert（只在装了 certifi 时才试，装不上就跳过、不报错）
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception as certifi_err:
+            serverchan_push.last_errors["certifi"] = str(certifi_err)
+            raise post_err
+        try:
+            _serverchan_post(key, title, body, timeout=timeout, context=ctx)
+            serverchan_push.last_method = "certifi-POST"
+            return True
+        except Exception as certifi_post_err:
+            serverchan_push.last_errors["certifi-POST"] = str(_bark_unwrap(certifi_post_err))
+        raise post_err
+
+
+def channel_of(key_entry):
+    """密钥的推送通道；老密钥没有 channel 字段时一律按 Bark 处理。"""
+    ch = (key_entry or {}).get("channel") or "bark"
+    return ch if ch in CHANNEL_LABELS else "bark"
+
+
+def push_with_channel(channel, key, title, body, timeout=10):
+    """按通道推送，返回 (ok, method, last_errors)。"""
+    if channel == "serverchan":
+        ok = serverchan_push(key, title, body, timeout=timeout)
+        return ok, serverchan_push.last_method, serverchan_push.last_errors
+    ok = bark_push(key, title, body, timeout=timeout)
+    return ok, bark_push.last_method, bark_push.last_errors
+
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -553,6 +718,8 @@ def save_json(path, obj):
 
 bark_push.last_method = ""
 bark_push.last_errors = {}
+serverchan_push.last_method = ""
+serverchan_push.last_errors = {}
 
 
 # ---------- 命令行版专用 ----------
@@ -597,18 +764,18 @@ def find_key(settings, key_name=None, key_id=None):
     return None
 
 
-def do_push(key, key_name, title, text, what):
+def do_push(key, key_name, title, text, what, channel="bark"):
+    label = "Bark 推送" if channel == "bark" else "Server酱推送"
     try:
-        ok = bark_push(key, title, text)
-        method = getattr(bark_push, "last_method", "")
-        log("Bark 推送：%s，推送到=%s，结果=%s%s，文本=%s。" % (what, key_name, "成功" if ok else "失败", ("（%s通了）" % method) if method else "", text))
+        ok, method, _errs = push_with_channel(channel, key, title, text)
+        log("%s：%s，推送到=%s，结果=%s%s，文本=%s。" % (label, what, key_name, "成功" if ok else "失败", ("（%s通了）" % method) if method else "", text))
         return ok
     except Exception as e:
         cause = e.reason if isinstance(e, urllib.error.URLError) and getattr(e, "reason", None) is not None else e
         if is_cert_error(cause):
-            log("Bark 推送失败：%s，推送到=%s，%s。" % (what, key_name, CERT_HUMAN))
+            log("%s失败：%s，推送到=%s，%s。" % (label, what, key_name, CERT_HUMAN))
         else:
-            log("Bark 推送失败：%s，推送到=%s，原因：%s。" % (what, key_name, cause))
+            log("%s失败：%s，推送到=%s，原因：%s。" % (label, what, key_name, cause))
         return False
 
 
@@ -659,20 +826,33 @@ def cmd_check(args):
             only_tickets = [t for t in tickets_g if t["mode"] == "only"]
             if check_tickets:
                 results = []
+                breakdowns = []
                 for t in check_tickets:
-                    tier, _a, _b = check_ticket(game, t, draw)
+                    if is_multi_ticket(game, t):
+                        counts = check_multi_ticket(game, t, draw)
+                        tier = next((x for x in TIER_ORDER if x in counts), None)
+                        if counts:
+                            result_text = multi_breakdown_text(game, counts)
+                            breakdowns.append(result_text)
+                        else:
+                            result_text = "没中"
+                    else:
+                        tier, _a, _b = check_ticket(game, t, draw)
+                        result_text = tier if tier else "没中"
                     results.append((tier,))
-                    t["last_result"] = "%s期：%s" % (issue, tier if tier else "没中")
+                    t["last_result"] = "%s期：%s" % (issue, result_text)
                     if t["monitor"] == "count":
                         remaining = max(0, int(t.get("remaining") if t.get("remaining") is not None else (t.get("count") or 1)) - 1)
                         t["remaining"] = remaining
                         if remaining == 0:
                             t["status"] = "stopped"
                     t.setdefault("pushed", []).append(issue)
-                    log("核对结果：%s %s + %s，%s期，%s。" % (game, fmt_nums(t["main"]), fmt_nums(t["back"]), issue, tier if tier else "没中"))
+                    log("核对结果：%s %s + %s，%s期，%s。" % (game, fmt_nums(t["main"]), fmt_nums(t["back"]), issue, result_text))
                 text, _win = build_check_texts(game, issue, dstr, results, draw_date)
+                for bd in breakdowns:
+                    text += " " + bd
                 title = "彩票开奖：%s" % draw_prefix(game, issue, draw_date)
-                do_push(k["key"], key_name, title, text, "%s第%s期" % (game, issue))
+                do_push(k["key"], key_name, title, text, "%s第%s期" % (game, issue), channel_of(k))
                 pushed_any = True
             if only_tickets:
                 for t in only_tickets:
@@ -685,7 +865,7 @@ def cmd_check(args):
                     t.setdefault("pushed", []).append(issue)
                 text = build_only_draw_text(game, issue, dstr, draw_date)
                 title = "彩票开奖：%s" % draw_prefix(game, issue, draw_date)
-                do_push(k["key"], key_name, title, text, "%s第%s期" % (game, issue))
+                do_push(k["key"], key_name, title, text, "%s第%s期" % (game, issue), channel_of(k))
                 pushed_any = True
     save_json(TICKETS_FILE, tickets)
     save_json(SETTINGS_FILE, settings)
@@ -721,7 +901,7 @@ def cmd_remind(args):
             log("购彩提醒跳过：%s，密钥已不在。" % r.get("text", ""))
             continue
         r["last_pushed"] = date_str
-        do_push(k["key"], k["name"], "购彩提醒", r.get("text", ""), "购彩提醒")
+        do_push(k["key"], k["name"], "购彩提醒", r.get("text", ""), "购彩提醒", channel_of(k))
     save_json(SETTINGS_FILE, settings)
     return 0
 
@@ -732,9 +912,16 @@ def cmd_test(args):
     if not k:
         print("没有找到叫“%s”的密钥，先用 add-key 加一个。" % args.key_name)
         return 1
-    ok = do_push(k["key"], k["name"], "彩票小软件测试", "Bark密钥测试成功，密钥名称：%s" % k["name"], "测试推送")
+    channel = channel_of(k)
+    if channel == "serverchan":
+        body = "Server酱测试成功，密钥名称：%s" % k["name"]
+        hint = "微信应该收到一条。如果没收到，检查 SendKey 对不对、微信里 Server酱 绑好没。"
+    else:
+        body = "Bark密钥测试成功，密钥名称：%s" % k["name"]
+        hint = "手机应该收到一条。如果没收到，检查密钥对不对、手机 Bark 装好没。"
+    ok = do_push(k["key"], k["name"], "彩票小软件测试", body, "测试推送", channel)
     if ok:
-        print("测试推送已发出，手机应该收到一条。如果没收到，检查密钥对不对、手机 Bark 装好没。")
+        print("测试推送已发出，%s" % hint)
         return 0
     print("测试推送失败，看上面日志里的原因。")
     return 1
@@ -745,10 +932,11 @@ def cmd_add_key(args):
     if any(k["name"] == args.name for k in settings["bark_keys"]):
         print("已经有叫“%s”的密钥了，换个名称。" % args.name)
         return 1
+    channel = args.channel or "bark"
     settings["bark_keys"].append({"id": str(int(time.time() * 1000)), "name": args.name,
-                                  "key": args.key, "push_time": "开奖后抓到就推"})
+                                  "key": args.key, "channel": channel, "push_time": "开奖后抓到就推"})
     save_json(SETTINGS_FILE, settings)
-    print("密钥“%s”已保存。下一步必须跑一次 test 验货：手机收到测试推送，才算链路真的通了。" % args.name)
+    print("密钥“%s”已保存（通道：%s）。下一步必须跑一次 test 验货：手机收到测试推送，才算链路真的通了。" % (args.name, CHANNEL_LABELS[channel]))
     return 0
 
 
@@ -769,13 +957,15 @@ def cmd_add_ticket(args):
     tickets = load_tickets()
     monitor = args.monitor
     count = max(1, min(10, args.count))
-    tickets.append({"id": int(time.time() * 1000), "game": args.game, "main": main, "back": back,
-                    "monitor": monitor, "count": count if monitor == "count" else 0,
-                    "remaining": count if monitor == "count" else None,
-                    "mode": args.mode, "key_id": k["id"], "status": "active",
-                    "last_result": "", "pushed": []})
+    ticket = {"id": int(time.time() * 1000), "game": args.game, "main": main, "back": back,
+              "monitor": monitor, "count": count if monitor == "count" else 0,
+              "remaining": count if monitor == "count" else None,
+              "mode": args.mode, "key_id": k["id"], "status": "active",
+              "last_result": "", "pushed": []}
+    tickets.append(ticket)
     save_json(TICKETS_FILE, tickets)
-    print("已加：%s %s + %s，推送到=%s。" % (args.game, fmt_nums(main), fmt_nums(back), args.key_name))
+    label = multi_ticket_label(args.game, ticket)
+    print("已加：%s %s + %s%s，推送到=%s。" % (args.game, fmt_nums(main), fmt_nums(back), ("，" + label) if label else "", args.key_name))
     return 0
 
 
@@ -812,15 +1002,17 @@ def cmd_list(args):
     if not settings["bark_keys"]:
         print("还没有密钥。")
     for k in settings["bark_keys"]:
-        print("- %s：%s" % (k["name"], mask_key(k["key"])))
+        print("- %s（%s）：%s" % (k["name"], CHANNEL_LABELS[channel_of(k)], mask_key(k["key"])))
     print("== 彩票 ==")
     if not tickets:
         print("还没有彩票。")
     for t in tickets:
         cfg = GAMES[t["game"]]
         k = find_key(settings, key_id=t["key_id"])
-        print("- %s %s + %s，%s，推送到=%s，%s，上次：%s" % (
+        label = multi_ticket_label(t["game"], t)
+        print("- %s %s + %s%s，%s，推送到=%s，%s，上次：%s" % (
             t["game"], fmt_nums(t["main"]), fmt_nums(t["back"]),
+            ("，" + label) if label else "",
             "一直守着" if t["monitor"] == "always" else "只对%d期（还剩%d次）" % (t.get("count") or 1, t.get("remaining") or 0),
             k["name"] if k else "（密钥已不在）",
             "监控中" if t["status"] == "active" else "已停止",
@@ -844,13 +1036,15 @@ def main(argv=None):
     sub.add_parser("remind", help="推送到点的购彩提醒（定时任务调这个）")
     t = sub.add_parser("test", help="给指定密钥发一条测试推送")
     t.add_argument("--key-name", required=True, help="密钥名称")
-    a = sub.add_parser("add-key", help="添加一个 Bark 密钥")
+    a = sub.add_parser("add-key", help="添加一个推送密钥")
     a.add_argument("--name", required=True, help="名称，比如：我的手机")
-    a.add_argument("--key", required=True, help="Bark key")
+    a.add_argument("--key", required=True, help="Bark key 或 Server酱 SendKey")
+    a.add_argument("--channel", default="bark", choices=["bark", "serverchan"],
+                   help="推送通道：bark 只能推 iPhone，serverchan 走微信、安卓苹果都能收（默认 bark）")
     at = sub.add_parser("add-ticket", help="添加一注彩票")
     at.add_argument("--game", required=True, choices=["双色球", "大乐透"])
-    at.add_argument("--main", required=True, help="主号，逗号隔开，比如 09,15,18,25,26,28")
-    at.add_argument("--back", required=True, help="后号，逗号隔开，比如 09")
+    at.add_argument("--main", required=True, help="主号，逗号隔开，比如 09,15,18,25,26,28；多填几个就是复式")
+    at.add_argument("--back", required=True, help="后号，逗号隔开，比如 09；多填几个就是复式")
     at.add_argument("--key-name", required=True, help="推送到哪个密钥")
     at.add_argument("--mode", default="check", choices=["check", "only"], help="check=核对模式，only=仅推开奖号")
     at.add_argument("--monitor", default="always", choices=["always", "count"], help="always=一直守着，count=只对x期")

@@ -1,13 +1,13 @@
 # 彩票开奖核对 Skill（agent 版）
 
 你是用户的智能体。这个 Skill 告诉你怎么用 `lottery_cli.py` 帮用户盯彩票：
-开奖后自动抓开奖号、核对用户买的号、用 Bark 推送到用户手机。
+开奖后自动抓开奖号、核对用户买的号，推送到用户手机。两个推送通道：Bark（只能推 iPhone）、Server酱（走微信，安卓苹果都能收）。
 
 ## 铁律（违反任何一条都算没干好）
 
 1. **号码绝不手抄**：核对必须由程序算，你绝不自己看图抄号、绝不自己心算中没中。
 你只负责跑命令、传话。数字漂移就是这么防住的。
-2. **密钥绝不外泄**：Bark key 只写进本机 `settings.json`，绝不打印完整 key、
+2. **密钥绝不外泄**：Bark key / Server酱 SendKey 只写进本机 `settings.json`，绝不打印完整 key、
 绝不写进聊天记录、绝不提交到仓库。给用户看时只显示前后各 3 位。
 3. **配好必须验货**：加完密钥必须跑一次 `test`，用户手机收到测试推送，
 才算链路真的通了。没收到就没配好，继续查，不许说“好了”。
@@ -27,19 +27,25 @@ python3 lottery_cli.py list # 跑通了就说明环境没问题
 
 ## 配置（用户告诉你三样东西，你填进去）
 
-用户会告诉你：① Bark key ② 买的彩票号码 ③ 什么时候推送。
+用户会告诉你：① 推送密钥（Bark key 或 Server酱 SendKey）② 买的彩票号码 ③ 什么时候推送。
 
 ```bash
 # 1. 加密钥（名称用户定，比如“我的手机”）
+# Bark：iPhone 上装 Bark App，打开 App 复制 key；只能推 iPhone。
 python3 lottery_cli.py add-key --name 我的手机 --key <Bark key>
+# Server酱：去 sct.ftqq.com 微信扫码登录，拿到 SendKey；走微信推送，安卓苹果都能收。
+python3 lottery_cli.py add-key --name 我的手机 --key <SendKey> --channel serverchan
 
-# 2. 验货：必须跑一次，用户手机收到测试推送才算通
+# 2. 验货：必须跑一次，用户手机收到测试推送才算通（两个通道都要各验一次）
 python3 lottery_cli.py test --key-name 我的手机
-# 没收到？查：key 对不对、手机 Bark 装好没、网络通不通。通了再往下走。
+# 没收到？Bark 查：key 对不对、手机 Bark 装好没、网络通不通；Server酱查：SendKey 对不对、微信里 Server酱 绑好没、网络通不通。通了再往下走。
 
 # 3. 加彩票（--main 主号逗号隔开，--back 后号逗号隔开）
 python3 lottery_cli.py add-ticket --game 双色球 --main 09,15,18,25,26,28 --back 09 --key-name 我的手机
 python3 lottery_cli.py add-ticket --game 大乐透 --main 09,15,18,25,26 --back 02,08 --key-name 我的手机
+# 复式：个数超出单式就是复式，程序自动识别、展开核对、汇总各奖级注数和固定奖金合计。
+# 比如大乐透 7+2（7 个前区、2 个后区，21 注、42 元）：
+python3 lottery_cli.py add-ticket --game 大乐透 --main 01,02,03,04,05,06,07 --back 01,02 --key-name 我的手机
 # 模式默认 check（核对模式）；--mode only 是仅推开奖号；--monitor count --count 3 是只对3期。
 
 # 4. 加购彩提醒（可选；weekdays 0=周一 … 6=周日，time 是北京时间 HH:MM）
@@ -81,11 +87,12 @@ python3 lottery_cli.py list
 ## 用户问“中没中”时
 
 跑 `python3 lottery_cli.py check`，把程序输出的核对结果原样告诉用户。
-不要自己推断、不要自己算。程序说没中就是没中，程序说中了就报奖级。
+不要自己推断、不要自己算。程序说没中就是没中，程序说中了就报奖级；
+复式票程序会报各奖级注数和固定奖金合计，原样转告就行，一/二等奖是浮动奖、只报注数。
 
 ## 出问题时
 
-- `test` 没收到推送：先查 key、再查手机 Bark、再查网络。逐一排除，别猜。
+- `test` 没收到推送：Bark 先查 key、再查手机 Bark、再查网络；Server酱先查 SendKey、再查微信绑定、再查网络。逐一排除，别猜。
 - `check` 抓取失败：程序会自己换备用源；都失败就如实告诉用户，下一轮再试。
 - 用户换号/换密钥：用 `add-ticket` / `add-key` 重新加，旧的在界面版里删，
 或直接改 `tickets.json` / `settings.json`（改前备份）。
